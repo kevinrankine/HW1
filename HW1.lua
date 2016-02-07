@@ -12,6 +12,7 @@ cmd:option('-epochs', 'number of sweeps over the training data')
 cmd:option('-learn', 'the learning rate')
 cmd:option('-lambda', 'regularization term')
 cmd:option('-batchsize', 'size of the minibatches to use in training')
+cmd:option('-outputfile', 'file to output test results to')
 
 function main()
    opt = cmd:parse(arg)
@@ -21,15 +22,15 @@ function main()
    
    if (classifier == 'nb') then
       local alpha = opt.alpha or 1
-      NB(datafile, alpha)
+      naive_bayes(datafile, alpha)
    elseif (classifier == 'log') then
-      logistic(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize))
+      logistic(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize), opt.outputfile)
    elseif (classifier == 'lsvm') then
       linear_svm(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize))
    end
 end
 
-function logistic(datafile, epochs, learn, lambda, batchsize)
+function logistic(datafile, epochs, learn, lambda, batchsize, outputfile)
    local f = hdf5.open(datafile, 'r')
    local nclasses = f:read('nclasses'):all():long()[1]
    local nfeatures = f:read('nfeatures'):all():long()[1]
@@ -38,13 +39,19 @@ function logistic(datafile, epochs, learn, lambda, batchsize)
    local train_output = f:read('train_output'):all()
    local valid_input = f:read('valid_input'):all()
    local valid_output = f:read('valid_output'):all()
+   local test_input = f:read('test_input'):all()
 
    W = torch.DoubleTensor(nclasses, nfeatures):zero()
    b = torch.DoubleTensor(nclasses):zero()
 
+   print ("-- Training...", "\n")
+
    l_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, learn, lambda, batchsize, L_ce, log_grad)
 
+   print ("-- Validating...", "\n")
+
    l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_ce)
+   l_test(nfeatures, nclasses, W, b, test_input, L_ce, outputfile)
 
 end
 
@@ -61,7 +68,11 @@ function linear_svm(datafile, epochs, learn, lambda, batchsize)
    W = torch.DoubleTensor(nclasses, nfeatures):zero()
    b = torch.DoubleTensor(nclasses):zero()
 
+   print ("-- Training...", "\n")
+
    l_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, learn, lambda, batchsize, L_hinge, hinge_grad)
+
+   print ("-- Validating...", "\n")
    l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_hinge)
 end
 
@@ -83,32 +94,6 @@ function logexpsum(z)
 end
 
 
-
-function strp1s(x) -- x is feature indicies vector (0, 1)
-   -- removes the dummy feature indicies and returns a new vector
-   local D = x:size(1)
-   local count = 0
-   for i = 1, D do
-      if x[i] ~= 1 then
-	 count = count + 1
-      end
-   end
-
-   if count == 0 then
-      return nil
-   end
-   
-   new_x = torch.LongTensor(count)
-   local j = 1
-   for i = 1, count do
-      while x[j] == 1 do
-	 j = j + 1
-      end
-      new_x[i] = x[j]
-      j = j + 1
-   end
-   return new_x
-end
 
 function L_ce(nfeatures, nclasses, W, b, x, y)
    -- cross-entropy loss for a single example
@@ -168,37 +153,6 @@ function hinge_grad(nfeatures, nclasses, x, y_hat, y, grad_W, grad_b, batchsize)
    end
 end
 
-
-function dL(nfeatures, nclasses, W, b, x, y)
-   -- finite difference gradients dL/dW and dL/db (for checking)
-
-   local epsilon_W = torch.DoubleTensor(nclasses, nfeatures):zero()
-   local epsilon_b = torch.DoubleTensor(nclasses):zero()
-
-   local grad_W = torch.DoubleTensor(nclasses, nfeatures):zero()
-   local grad_b = torch.DoubleTensor(nclasses):zero()
-
-   for class = 1, nclasses do
-      for j = 1, x:size(1) do
-	 epsilon_W[class][x[j]] = 1e-3
-	 local derivative = (L_ce(nfeatures, nclasses, W + epsilon_W, b, x, y)[1] -
-				L_ce(nfeatures, nclasses, W - epsilon_W, b, x, y)[1]) / (2 * 1e-3)
-	 grad_W[class][x[j]] = derivative
-
-	 epsilon_W:zero()
-      end
-      epsilon_b[class] = 1e-3
-      
-      local derivative = (L_ce(nfeatures, nclasses, W, b + epsilon_b, x, y)[1] -
-			     L_ce(nfeatures, nclasses, W, b - epsilon_b, x, y)[1]) / (2 * 1e-3)
-
-      grad_b[class] = derivative
-      epsilon_b:zero()
-   end
-
-   return grad_W, grad_b
-end
-
 function log_grad(nfeatures, nclasses, x, y_hat, y, grad_W, grad_b, batch_size)
    -- ***UPDATES*** the gradient passed in by a factor of 1/batch_size
    -- you must zero the gradient at the start
@@ -216,8 +170,6 @@ function log_grad(nfeatures, nclasses, x, y_hat, y, grad_W, grad_b, batch_size)
       end
    end
 end
-
-
 
 function l_train(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, batchsize, L_f, L_g)
    local epochs = epochs or 1
@@ -306,14 +258,14 @@ function l_validate(nfeatures, nclasses, W, b, X, Y, L_f)
    print ("Percent correct on validation: ", pct_correct * 100)
 end
 
-function NB(datafile, alpha) 
+function naive_bayes(datafile, alpha) 
    -- Parse input params
 
    
    print ("-- Reading input...", "\n")
    
    local f = hdf5.open(datafile, 'r')
-   local alpha = 1 or alpha
+   local alpha = alpha or 1.0
    local nclasses = f:read('nclasses'):all():long()[1]
    local nfeatures = f:read('nfeatures'):all():long()[1]
    
@@ -323,10 +275,10 @@ function NB(datafile, alpha)
    local valid_output = f:read('valid_output'):all()
 
    print ("-- Training", "\n")
-   local priors, likelihood = NB_train(nfeatures, nclasses, train_input, train_output, alpha)
+   local priors, likelihood = nb_train(nfeatures, nclasses, train_input, train_output, alpha)
    
    print ("-- Validating", "\n")
-   local nb_output = NB_predict(nclasses, nfeatures, valid_input, priors, likelihood)
+   local nb_output = nb_predict(nclasses, nfeatures, valid_input, priors, likelihood)
 
    percent_correct = 0
    
@@ -336,10 +288,10 @@ function NB(datafile, alpha)
       end
    end
 
-   print (percent_correct)
+   print ("Percent correct on validation", percent_correct * 100)
 end
 
-function NB_train(nfeatures, nclasses, train_input, train_output, alpha)
+function nb_train(nfeatures, nclasses, train_input, train_output, alpha)
    -- define parameters related
    
    local N = train_input:size(1) -- number of examples
@@ -348,8 +300,8 @@ function NB_train(nfeatures, nclasses, train_input, train_output, alpha)
    local Y = train_output -- output matrix (row i is class of xi)
    
    local priors = torch.FloatTensor(nclasses):zero()
-   local F = torch.LongTensor(nfeatures, nclasses):zero():add(alpha)
-   local F_class = torch.LongTensor(nclasses):zero()
+   local F = torch.DoubleTensor(nfeatures, nclasses):zero():add(alpha)
+   local F_class = torch.DoubleTensor(nclasses):zero()
    local likelihood = torch.FloatTensor(nfeatures, nclasses):zero()
    
    -- TODO: populate priors
@@ -388,7 +340,7 @@ function NB_train(nfeatures, nclasses, train_input, train_output, alpha)
    return priors, likelihood
 end
 
-function NB_predict(nclasses, nfeatures, X, priors, likelihood)
+function nb_predict(nclasses, nfeatures, X, priors, likelihood)
    N = X:size(1)
    D = X:size(2)
    Y = torch.FloatTensor(N)
@@ -413,6 +365,91 @@ function NB_predict(nclasses, nfeatures, X, priors, likelihood)
    end
 
    return Y
+end
+
+function l_test(nfeatures, nclasses, W, b, X, L_f, outputfile)
+   local N = X:size(1)
+   local pct_correct = 0.0
+
+   outputfile = outputfile or "output.txt"
+   outputfile = io.open(outputfile, 'w')
+   outputfile:write("ID,Category\n")
+
+   for i = 1, N do
+      local x = strp1s(X[i]:type('torch.LongTensor'))
+      local loss, y_hat = L_f(nfeatures,
+			      nclasses,
+			      W,
+			      b,
+			      x,
+			      1)
+
+      for j = 1, nclasses do
+	 if (y_hat[j][1] == y_hat:max()) then
+	    outputfile:write(string.format("%d,%d\n", i, j))
+	 end
+      end
+   end
+
+   outputfile:close()
+end
+
+function dL(nfeatures, nclasses, W, b, x, y)
+   -- finite difference gradients dL/dW and dL/db (for checking)
+
+   local epsilon_W = torch.DoubleTensor(nclasses, nfeatures):zero()
+   local epsilon_b = torch.DoubleTensor(nclasses):zero()
+
+   local grad_W = torch.DoubleTensor(nclasses, nfeatures):zero()
+   local grad_b = torch.DoubleTensor(nclasses):zero()
+
+   for class = 1, nclasses do
+      for j = 1, x:size(1) do
+	 epsilon_W[class][x[j]] = 1e-3
+	 local derivative = (L_ce(nfeatures, nclasses, W + epsilon_W, b, x, y)[1] -
+				L_ce(nfeatures, nclasses, W - epsilon_W, b, x, y)[1]) / (2 * 1e-3)
+	 grad_W[class][x[j]] = derivative
+
+	 epsilon_W:zero()
+      end
+      epsilon_b[class] = 1e-3
+      
+      local derivative = (L_ce(nfeatures, nclasses, W, b + epsilon_b, x, y)[1] -
+			     L_ce(nfeatures, nclasses, W, b - epsilon_b, x, y)[1]) / (2 * 1e-3)
+
+      grad_b[class] = derivative
+      epsilon_b:zero()
+   end
+
+   return grad_W, grad_b
+end
+
+
+
+function strp1s(x) -- x is feature indicies vector (0, 1)
+   -- removes the dummy feature indicies and returns a new vector
+   local D = x:size(1)
+   local count = 0
+   for i = 1, D do
+      if x[i] ~= 1 then
+	 count = count + 1
+      end
+   end
+
+   if count == 0 then
+      return nil
+   end
+   
+   new_x = torch.LongTensor(count)
+   local j = 1
+   for i = 1, count do
+      while x[j] == 1 do
+	 j = j + 1
+      end
+      new_x[i] = x[j]
+      j = j + 1
+   end
+   return new_x
 end
 
 main()
