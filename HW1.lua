@@ -1,5 +1,6 @@
 -- Only requirement allowed
 require("hdf5")
+require("math")
 
 cmd = torch.CmdLine()
 
@@ -23,8 +24,8 @@ function main()
       NB(datafile, alpha)
    elseif (classifier == 'log') then
       logistic(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize))
-   else
-      -- hinge loss svm
+   elseif (classifier == 'lsvm') then
+      linear_svm(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize))
    end
 end
 
@@ -41,10 +42,27 @@ function logistic(datafile, epochs, learn, lambda, batchsize)
    W = torch.DoubleTensor(nclasses, nfeatures):zero()
    b = torch.DoubleTensor(nclasses):zero()
 
-   logistic_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, learn, lambda, batchsize)
+   l_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, learn, lambda, batchsize, L_ce, log_grad)
 
-   logistic_validate(nfeatures, nclasses, W, b, valid_input, valid_output)
+   l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_ce)
 
+end
+
+function linear_svm(datafile, epochs, learn, lambda, batchsize)   
+   local f = hdf5.open(datafile, 'r')
+   local nclasses = f:read('nclasses'):all():long()[1]
+   local nfeatures = f:read('nfeatures'):all():long()[1]
+   
+   local train_input = f:read('train_input'):all()
+   local train_output = f:read('train_output'):all()
+   local valid_input = f:read('valid_input'):all()
+   local valid_output = f:read('valid_output'):all()
+
+   W = torch.DoubleTensor(nclasses, nfeatures):zero()
+   b = torch.DoubleTensor(nclasses):zero()
+
+   l_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, learn, lambda, batchsize, L_hinge, hinge_grad)
+   l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_hinge)
 end
 
 function softmax(nfeatures, nclasses, W, b, x, y)
@@ -95,6 +113,7 @@ end
 function L_ce(nfeatures, nclasses, W, b, x, y)
    -- cross-entropy loss for a single example
    -- in this case y would be the class, not one hot coded
+   -- doesn't include regularized term
    
    if (x == nil) then
       return nil, nil
@@ -103,13 +122,56 @@ function L_ce(nfeatures, nclasses, W, b, x, y)
    local loss = -(z[y] - logexpsum(z)) -- -log(p(c|x))
    local y_hat = torch.exp(z:add(-logexpsum(z)))
 
+   return loss[1], y_hat
+end
+
+function L_hinge(nfeatures, nclasses, W, b, x, y)
+   if (x == nil) then
+      return nil, nil
+   end
+   
+   local y_hat = W:index(2, x):sum(2):add(b)
+   
+   local y_pi = 1
+   
+   for i = 1, nclasses do
+      if y_hat[i][1] > y_hat[y_pi][1] and i ~= y then
+	 y_pi = i -- index of second largest
+      end
+   end
+
+   local loss = math.max(0, y_hat[y][1] - y_hat[y_pi][1])
    return loss, y_hat
+end
+
+function hinge_grad(nfeatures, nclasses, x, y_hat, y, grad_W, grad_b, batchsize)
+   local y_pi = 1
+   
+   for i = 1, nclasses do
+      if y_hat[i][1] > y_hat[y_pi][1] and i ~= y then
+	 y_pi = i -- index of second largest
+      end
+   end
+
+   if (y_hat[y][1] - y_hat[y_pi][1] > 1) then
+      return -- zero gradient
+   else
+      local val = torch.DoubleTensor(x:size(1)):fill(1 / batchsize)
+      
+      grad_W[y_pi]:indexAdd(1, x, val)
+      grad_b[y_pi] = 1 / batchsize
+
+      val:fill(-1 / batchsize)
+      grad_W[y]:indexAdd(1, x, val)
+      grad_b[y] = -1 / batchsize
+
+   end
 end
 
 
 function dL(nfeatures, nclasses, W, b, x, y)
    -- finite difference gradients dL/dW and dL/db (for checking)
-   
+
    local epsilon_W = torch.DoubleTensor(nclasses, nfeatures):zero()
    local epsilon_b = torch.DoubleTensor(nclasses):zero()
 
@@ -140,6 +202,7 @@ end
 function log_grad(nfeatures, nclasses, x, y_hat, y, grad_W, grad_b, batch_size)
    -- ***UPDATES*** the gradient passed in by a factor of 1/batch_size
    -- you must zero the gradient at the start
+   
    for i = 1, nclasses do
       if y == i then
 	 local vals = torch.DoubleTensor(x:size(1)):fill(-(1 - y_hat[i][1]) / batch_size)
@@ -154,10 +217,13 @@ function log_grad(nfeatures, nclasses, x, y_hat, y, grad_W, grad_b, batch_size)
    end
 end
 
-function logistic_train(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, batchsize)
+
+
+function l_train(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, batchsize, L_f, L_g)
    local epochs = epochs or 1
-   local rate = rate or 1
+   local rate = rate or 1.0
    local batch_size = batchsize or 100
+   local lambda = lambda or 0.1
    
    local N = X:size(1)
    local n = N
@@ -178,16 +244,16 @@ function logistic_train(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, b
 	 for j = 1, batch_size do
 	    local x = strp1s(X[i]:type('torch.LongTensor'))
 	    local y = Y[i]
-	    local loss, y_hat = L_ce(nfeatures,
+	    local loss, y_hat = L_f(nfeatures,
 				     nclasses,
 				     W,
 				     b,
 				     x,
 				     y)
 	    if (loss ~= nil) then
-	       total_loss = total_loss  + loss[1]
+	       total_loss = total_loss  + loss
 	       -- should add a bit of a gradient
-	       log_grad(nfeatures, nclasses, x, y_hat, y, grad_W, grad_b, batch_size)
+	       L_g(nfeatures, nclasses, x, y_hat, y, grad_W, grad_b, batch_size)
 	       
 	       --local dW, db = dL(nfeatures, nclasses, W, b, x, y)
 	       --print (torch.sum(torch.abs( dW - grad_W)))
@@ -203,7 +269,7 @@ function logistic_train(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, b
 	       break
 	    end
 	 end
-	 W:add(grad_W:mul(-rate))
+	 W:mul(1 - rate * lambda / n):add(grad_W:mul(-rate))
 	 b:add(grad_b:mul(-rate))
 
 	 grad_W:zero()
@@ -220,13 +286,13 @@ function logistic_train(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, b
    -- b:add(grad_b:mul(-rate / batch_size))
 end
 
-function logistic_validate(nfeatures, nclasses, W, b, X, Y)
+function l_validate(nfeatures, nclasses, W, b, X, Y, L_f)
    local N = X:size(1)
    local pct_correct = 0.0
    for i = 1, N do
       local x = strp1s(X[i]:type('torch.LongTensor'))
       local y = Y[i]
-      local loss, y_hat = L_ce(nfeatures,
+      local loss, y_hat = L_f(nfeatures,
 			       nclasses,
 			       W,
 			       b,
