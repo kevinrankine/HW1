@@ -23,11 +23,11 @@ function main()
    
    if (classifier == 'nb') then
       local alpha = opt.alpha or 1
-      naive_bayes(datafile, alpha)
+      naive_bayes(datafile, alpha, tonumber(opt.kfold))
    elseif (classifier == 'log') then
       logistic(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize), opt.outputfile, tonumber(opt.kfold))
    elseif (classifier == 'lsvm') then
-      linear_svm(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize))
+      linear_svm(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize), tonumber(opt.kfold))
    end
 end
 
@@ -64,26 +64,31 @@ function logistic(datafile, epochs, learn, lambda, batchsize, outputfile, kfold)
 
 end
 
-function linear_svm(datafile, epochs, learn, lambda, batchsize)   
+function linear_svm(datafile, epochs, learn, lambda, batchsize, kfold)   
    local f = hdf5.open(datafile, 'r')
    local nclasses = f:read('nclasses'):all():long()[1]
    local nfeatures = f:read('nfeatures'):all():long()[1]
    
    local train_input = f:read('train_input'):all()
    local train_output = f:read('train_output'):all()
-   local valid_input = f:read('valid_input'):all()
-   local valid_output = f:read('valid_output'):all()
+
 
    W = torch.DoubleTensor(nclasses, nfeatures):zero()
    b = torch.DoubleTensor(nclasses):zero()
 
-   print ("-- Training...", "\n")
+   if (kfold) then
+      l_kfold(nfeatures, nclasses, W, b, train_input, train_output, epochs, rate, lambda, batchsize, L_hinge, hinge_grad, kfold)
+   else
+      local valid_input = f:read('valid_input'):all()
+      local valid_output = f:read('valid_output'):all()
+      print ("-- Training...", "\n")
 
-   l_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, learn, lambda, batchsize, L_hinge, hinge_grad)
+      l_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, learn, lambda, batchsize, L_hinge, hinge_grad)
 
-   print ("-- Validating...", "\n")
-   local acc = l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_hinge)
-   print ("Validation accuracy: ", acc * 100)
+      print ("-- Validating...", "\n")
+      local acc = l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_hinge)
+      print ("Validation accuracy: ", acc * 100)
+   end
 end
 
 function softmax(nfeatures, nclasses, W, b, x, y)
@@ -238,6 +243,63 @@ function l_kfold(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, batchsiz
    print ("Average validation accuracy was: ", avg_acc)
 end
 
+function nb_kfold(nfeatures, nclasses, X, Y, alpha, k)
+   local N = X:size(1)
+   local D = X:size(2)
+   local shuffle_indicies = torch.randperm(N):type('torch.LongTensor')
+
+
+   local X = X:index(1, shuffle_indicies)
+   local Y = Y:index(1, shuffle_indicies)
+
+   folds = {}
+   local avg_acc = 0.0
+   
+   for fold = 1, k do
+      i = (N / k) * fold - (N / k) + 1
+      folds[fold] = {}
+      if (fold < k) then
+	 folds[fold]['X'] = X:narrow(1, i, N / k)
+	 folds[fold]['Y'] = Y:narrow(1, i, N / k)
+      else
+	 folds[fold]['X'] = X:narrow(1, i, N - i)
+	 folds[fold]['Y'] = Y:narrow(1, i, N - i)
+      end
+   end
+
+   for valid = 1, k do
+      local valid_input = folds[valid]['X']
+      local valid_output = folds[valid]['Y']
+
+      local train_input = torch.ones(1, D):type('torch.IntTensor')
+      local train_output = torch.ones(1):type('torch.IntTensor')
+
+      for test = 1, k do
+	 if test ~=valid then
+	    train_input = torch.cat(train_input, folds[test].X, 1)
+	    train_output = torch.cat(train_output, folds[test].Y, 1)
+	 end
+      end
+      
+      local priors, likelihood = nb_train(nfeatures, nclasses, train_input, train_output, alpha)
+
+      local nb_output = nb_predict(nclasses, nfeatures, valid_input, priors, likelihood)
+
+      local pct = 0.0
+   
+      for i = 1, valid_output:size(1) do
+	 if valid_output[i] == nb_output[i] then
+	    pct = pct + 1 / (valid_output:size(1))
+	 end
+      end
+
+      print ("Percent correct on validation", pct * 100)
+      
+      avg_acc = avg_acc + pct / k
+   end
+   print ("Average validation accuracy was: ", avg_acc)
+end
+
 function l_train(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, batchsize, L_f, L_g)
    
    local epochs = epochs or 1
@@ -331,7 +393,7 @@ function l_validate(nfeatures, nclasses, W, b, X, Y, L_f)
    return pct_correct
 end
 
-function naive_bayes(datafile, alpha) 
+function naive_bayes(datafile, alpha, kfold) 
    -- Parse input params
 
    
@@ -344,24 +406,29 @@ function naive_bayes(datafile, alpha)
    
    local train_input = f:read('train_input'):all()
    local train_output = f:read('train_output'):all()
-   local valid_input = f:read('valid_input'):all()
-   local valid_output = f:read('valid_output'):all()
 
-   print ("-- Training", "\n")
-   local priors, likelihood = nb_train(nfeatures, nclasses, train_input, train_output, alpha)
-   
-   print ("-- Validating", "\n")
-   local nb_output = nb_predict(nclasses, nfeatures, valid_input, priors, likelihood)
+   if (kfold) then
+      nb_kfold(nfeatures, nclasses, train_input, train_output, alpha, kfold)
+   else
+      local valid_input = f:read('valid_input'):all()
+      local valid_output = f:read('valid_output'):all()
 
-   percent_correct = 0
-   
-   for i = 1, valid_output:size(1) do
-      if valid_output[i] == nb_output[i] then
-	 percent_correct = percent_correct + 1 / (valid_output:size(1))
+      print ("-- Training", "\n")
+      local priors, likelihood = nb_train(nfeatures, nclasses, train_input, train_output, alpha)
+      
+      print ("-- Validating", "\n")
+      local nb_output = nb_predict(nclasses, nfeatures, valid_input, priors, likelihood)
+
+      percent_correct = 0
+      
+      for i = 1, valid_output:size(1) do
+	 if valid_output[i] == nb_output[i] then
+	    percent_correct = percent_correct + 1 / (valid_output:size(1))
+	 end
       end
-   end
 
-   print ("Percent correct on validation", percent_correct * 100)
+      print ("Percent correct on validation", percent_correct * 100)
+   end
 end
 
 function nb_train(nfeatures, nclasses, train_input, train_output, alpha)
