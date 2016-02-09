@@ -1,1 +1,0 @@
-th HW1.lua -datafile SST1.hdf5 -classifier log -epochs 2 -lambda 1 -learn 1 -batchsize 10

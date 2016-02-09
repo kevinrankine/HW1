@@ -13,6 +13,7 @@ cmd:option('-learn', 'the learning rate')
 cmd:option('-lambda', 'regularization term')
 cmd:option('-batchsize', 'size of the minibatches to use in training')
 cmd:option('-outputfile', 'file to output test results to')
+cmd:option('-kfold', 'whether to use k-fold cross validation and with what parameter if so')
 
 function main()
    opt = cmd:parse(arg)
@@ -24,34 +25,42 @@ function main()
       local alpha = opt.alpha or 1
       naive_bayes(datafile, alpha)
    elseif (classifier == 'log') then
-      logistic(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize), opt.outputfile)
+      logistic(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize), opt.outputfile, tonumber(opt.kfold))
    elseif (classifier == 'lsvm') then
       linear_svm(datafile, tonumber(opt.epochs), tonumber(opt.learn), tonumber(opt.lambda), tonumber(opt.batchsize))
    end
 end
 
-function logistic(datafile, epochs, learn, lambda, batchsize, outputfile)
+function logistic(datafile, epochs, learn, lambda, batchsize, outputfile, kfold)
    local f = hdf5.open(datafile, 'r')
    local nclasses = f:read('nclasses'):all():long()[1]
    local nfeatures = f:read('nfeatures'):all():long()[1]
    
    local train_input = f:read('train_input'):all()
    local train_output = f:read('train_output'):all()
-   local valid_input = f:read('valid_input'):all()
-   local valid_output = f:read('valid_output'):all()
-   local test_input = f:read('test_input'):all()
+   
 
-   W = torch.DoubleTensor(nclasses, nfeatures):zero()
-   b = torch.DoubleTensor(nclasses):zero()
+   local W = torch.DoubleTensor(nclasses, nfeatures):zero()
+   local b = torch.DoubleTensor(nclasses):zero()
 
-   print ("-- Training...", "\n")
+   if (kfold) then
+      l_kfold(nfeatures, nclasses, W, b, train_input, train_output, epochs, rate, lambda, batchsize, L_ce, log_grad, kfold)
+   else
+      local valid_input = f:read('valid_input'):all()
+      local valid_output = f:read('valid_output'):all()
+      local test_input = f:read('test_input'):all()
+      print ("-- Training...", "\n")
+      
+      l_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, learn, lambda, batchsize, L_ce, log_grad)
+      
+      print ("-- Validating...", "\n")
+      
+      local acc = l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_ce)
+      print ("Validation accuracy: ", acc * 100)
+      l_test(nfeatures, nclasses, W, b, test_input, L_ce, outputfile)
+   end
 
-   l_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, learn, lambda, batchsize, L_ce, log_grad)
-
-   print ("-- Validating...", "\n")
-
-   l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_ce)
-   l_test(nfeatures, nclasses, W, b, test_input, L_ce, outputfile)
+   
 
 end
 
@@ -73,7 +82,8 @@ function linear_svm(datafile, epochs, learn, lambda, batchsize)
    l_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, learn, lambda, batchsize, L_hinge, hinge_grad)
 
    print ("-- Validating...", "\n")
-   l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_hinge)
+   local acc = l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_hinge)
+   print ("Validation accuracy: ", acc * 100)
 end
 
 function softmax(nfeatures, nclasses, W, b, x, y)
@@ -93,8 +103,6 @@ function logexpsum(z)
    return (torch.log(torch.sum(torch.exp(torch.add(z, -M))))) + M
 end
 
-
-
 function L_ce(nfeatures, nclasses, W, b, x, y)
    -- cross-entropy loss for a single example
    -- in this case y would be the class, not one hot coded
@@ -103,7 +111,8 @@ function L_ce(nfeatures, nclasses, W, b, x, y)
    if (x == nil) then
       return nil, nil
    end
-   local z = W:index(2, x):sum(2):add(b) -- 
+   local z = W:index(2, x):sum(2):add(b) --
+
    local loss = -(z[y] - logexpsum(z)) -- -log(p(c|x))
    local y_hat = torch.exp(z:add(-logexpsum(z)))
 
@@ -117,20 +126,29 @@ function L_hinge(nfeatures, nclasses, W, b, x, y)
    
    local y_hat = W:index(2, x):sum(2):add(b)
    
-   local y_pi = 1
+   local y_pi = (y + 1) % nclasses
+
+   if (y_pi == 0) then
+      y_pi = 1
+   end
    
    for i = 1, nclasses do
-      if y_hat[i][1] > y_hat[y_pi][1] and i ~= y then
+      if y_hat[i][1] >= y_hat[y_pi][1] and i ~= y then
 	 y_pi = i -- index of second largest
       end
    end
 
-   local loss = math.max(0, y_hat[y][1] - y_hat[y_pi][1])
+   local loss = math.max(0, 1 - (y_hat[y][1] - y_hat[y_pi][1]))
    return loss, y_hat
 end
 
 function hinge_grad(nfeatures, nclasses, x, y_hat, y, grad_W, grad_b, batchsize)
    local y_pi = 1
+   local y_pi = (y + 1) % nclasses
+
+   if (y_pi == 0) then
+      y_pi = 1
+   end
    
    for i = 1, nclasses do
       if y_hat[i][1] > y_hat[y_pi][1] and i ~= y then
@@ -171,7 +189,57 @@ function log_grad(nfeatures, nclasses, x, y_hat, y, grad_W, grad_b, batch_size)
    end
 end
 
+
+function l_kfold(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, batchsize, L_f, L_g, k)
+   local N = X:size(1)
+   local D = X:size(2)
+   local shuffle_indicies = torch.randperm(N):type('torch.LongTensor')
+
+
+   local X = X:index(1, shuffle_indicies)
+   local Y = Y:index(1, shuffle_indicies)
+
+   folds = {}
+   local avg_acc = 0.0
+   
+   for fold = 1, k do
+      i = (N / k) * fold - (N / k) + 1
+      folds[fold] = {}
+      if (fold < k) then
+	 folds[fold]['X'] = X:narrow(1, i, N / k)
+	 folds[fold]['Y'] = Y:narrow(1, i, N / k)
+      else
+	 folds[fold]['X'] = X:narrow(1, i, N - i)
+	 folds[fold]['Y'] = Y:narrow(1, i, N - i)
+      end
+   end
+
+   for valid = 1, k do
+      local valid_input = folds[valid]['X']
+      local valid_output = folds[valid]['Y']
+
+      local train_input = torch.ones(1, D):type('torch.IntTensor')
+      local train_output = torch.ones(1):type('torch.IntTensor')
+
+      for test = 1, k do
+	 if test ~=valid then
+	    train_input = torch.cat(train_input, folds[test].X, 1)
+	    train_output = torch.cat(train_output, folds[test].Y, 1)
+	 end
+      end
+      
+      l_train(nfeatures, nclasses, W, b, train_input, train_output, epochs, rate, lambda, batchsize, L_f, L_g)
+      local pct = l_validate(nfeatures, nclasses, W, b, valid_input, valid_output, L_ce)
+      avg_acc = avg_acc + pct / k
+      
+      W:zero()
+      b:zero()
+   end
+   print ("Average validation accuracy was: ", avg_acc)
+end
+
 function l_train(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, batchsize, L_f, L_g)
+   
    local epochs = epochs or 1
    local rate = rate or 1.0
    local batch_size = batchsize or 100
@@ -227,7 +295,8 @@ function l_train(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, batchsiz
 	 grad_W:zero()
 	 grad_b:zero()
       end
-      -- print ("Training Loss: ", total_loss)
+      total_loss = total_loss + (lambda / 2) * torch.pow(W, 2):sum()
+      print ("Training Loss: ", total_loss)
       print ("Percent correct on training: ", 100 * pct_correct)
       total_loss = 0
       pct_correct = 0
@@ -237,6 +306,8 @@ function l_train(nfeatures, nclasses, W, b, X, Y, epochs, rate, lambda, batchsiz
    -- W:index(2, x):add(grad_W:index(2, x):mul(-rate / batch_size))
    -- b:add(grad_b:mul(-rate / batch_size))
 end
+
+
 
 function l_validate(nfeatures, nclasses, W, b, X, Y, L_f)
    local N = X:size(1)
@@ -251,11 +322,13 @@ function l_validate(nfeatures, nclasses, W, b, X, Y, L_f)
 			       x,
 			       y)
 
-      if (y_hat[y][1] == torch.max(y_hat) ) then
+      if (y_hat ~= nil and y_hat[y][1] == torch.max(y_hat) ) then
 	 pct_correct = pct_correct + 1 / N
       end
    end
-   print ("Percent correct on validation: ", pct_correct * 100)
+   -- print ("Percent correct on validation: ", pct_correct * 100)
+
+   return pct_correct
 end
 
 function naive_bayes(datafile, alpha) 
